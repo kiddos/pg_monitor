@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::{Client, Config as PgConfig, NoTls};
 use crate::model::Statement;
 
 pub struct DbClient {
@@ -7,14 +7,15 @@ pub struct DbClient {
 }
 
 impl DbClient {
-    pub async fn connect(connection_str: &str) -> Result<Self> {
-        let (client, connection) = tokio_postgres::connect(connection_str, NoTls)
+    pub async fn connect(pg_config: &PgConfig) -> Result<Self> {
+        let (client, connection) = pg_config
+            .connect(NoTls)
             .await
-            .with_context(|| format!("Failed to connect to PostgreSQL using: {}", connection_str))?;
+            .with_context(|| "Failed to connect to PostgreSQL database")?;
 
         tokio::spawn(async move {
             if let Err(e) = connection.await {
-                eprintln!("PostgreSQL connection error: {}", e);
+                eprintln!("PostgreSQL connection background error: {}", e);
             }
         });
 
@@ -22,14 +23,6 @@ impl DbClient {
     }
 
     pub async fn fetch_statements(&self, page_size: i64, page: i64) -> Result<Vec<Statement>> {
-        // Query required:
-        // SELECT userid, dbid, queryid, query,
-        // total_exec_time, min_exec_time, max_exec_time, mean_exec_time, stddev_exec_time,
-        // rows, calls
-        // FROM pg_stat_statements
-        // ORDER BY total_exec_time DESC
-        // LIMIT $pageSize OFFSET $page
-
         let sql = "SELECT userid, dbid, queryid, query, \
                     total_exec_time, min_exec_time, max_exec_time, mean_exec_time, stddev_exec_time, \
                     rows, calls \
@@ -38,16 +31,11 @@ impl DbClient {
                     LIMIT $1 OFFSET $2";
 
         let offset = page * page_size;
-        let rows = self.client.query(sql, &[&page_size, &offset]).await?;
+        let rows = self.client.query(sql, &[&page_size, &offset]).await
+            .with_context(|| "Failed executing query on pg_stat_statements. Is pg_stat_statements extension created?")?;
 
         let mut statements = Vec::new();
         for row in rows {
-            // Postgres types handling:
-            // userid is Oid or int8/int4
-            // dbid is Oid or int8/int4
-            // queryid is int8
-            // exec times can be double precision (f64)
-            // rows and calls can be int8 (i64)
             let userid: i64 = row.try_get::<_, i64>(0)
                 .or_else(|_| row.try_get::<_, i32>(0).map(|v| v as i64))
                 .or_else(|_| row.try_get::<_, u32>(0).map(|v| v as i64))

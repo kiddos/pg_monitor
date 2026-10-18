@@ -23,11 +23,19 @@ use tui::{run_app, App};
 async fn main() -> Result<()> {
     let config = Config::parse();
 
+    let pg_config = match config.build_pg_config() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("Invalid PostgreSQL configuration: {}", e);
+            std::process::exit(1);
+        }
+    };
+
     // Try connecting to database
-    let db_client = match DbClient::connect(&config.connection_string).await {
+    let db_client = match DbClient::connect(&pg_config).await {
         Ok(client) => Some(client),
         Err(e) => {
-            eprintln!("Warning: Failed to connect to database: {}", e);
+            eprintln!("Warning: Initial database connection failed: {:#}", e);
             None
         }
     };
@@ -40,7 +48,7 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app and run
-    let app = App::new(config);
+    let app = App::new(config, pg_config);
     let res = run_app(&mut terminal, app, db_client).await;
 
     // Restore terminal
@@ -49,7 +57,7 @@ async fn main() -> Result<()> {
     terminal.show_cursor()?;
 
     if let Err(err) = res {
-        println!("{:?}", err);
+        eprintln!("Application error: {:?}", err);
     }
 
     Ok(())

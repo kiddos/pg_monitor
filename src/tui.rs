@@ -9,6 +9,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::time::{Duration, Instant};
+use tokio_postgres::Config as PgConfig;
 
 use crate::config::Config;
 use crate::db::DbClient;
@@ -16,6 +17,7 @@ use crate::model::Statement;
 
 pub struct App {
     pub config: Config,
+    pub pg_config: PgConfig,
     pub statements: Vec<Statement>,
     pub table_state: TableState,
     pub page: i64,
@@ -27,11 +29,12 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config, pg_config: PgConfig) -> Self {
         let mut table_state = TableState::default();
         table_state.select(Some(0));
         Self {
             config,
+            pg_config,
             statements: Vec::new(),
             table_state,
             page: 0,
@@ -98,29 +101,46 @@ impl App {
     }
 }
 
-pub async fn run_app<B: Backend>(
-    terminal: &mut Terminal<B>,
-    mut app: App,
-    db_client: Option<DbClient>,
-) -> Result<()> {
-    let tick_rate = Duration::from_millis(250);
+async fn fetch_or_reconnect(app: &mut App, db_client: &mut Option<DbClient>) {
+    app.is_loading = true;
+    if db_client.is_none() {
+        match DbClient::connect(&app.pg_config).await {
+            Ok(client) => {
+                *db_client = Some(client);
+            }
+            Err(e) => {
+                app.error_message = Some(format!("Connection error: {:#}", e));
+                app.is_loading = false;
+                return;
+            }
+        }
+    }
 
-    // Initial fetch
     if let Some(ref db) = db_client {
-        app.is_loading = true;
         match db.fetch_statements(app.config.page_size, app.page).await {
             Ok(stats) => {
                 app.statements = stats;
                 app.error_message = None;
             }
             Err(e) => {
-                app.error_message = Some(e.to_string());
+                app.error_message = Some(format!("Query error: {:#}", e));
+                // Discard broken client so next attempt reconnects
+                *db_client = None;
             }
         }
-        app.is_loading = false;
-    } else {
-        app.error_message = Some("Database client not connected".to_string());
     }
+    app.is_loading = false;
+}
+
+pub async fn run_app<B: Backend>(
+    terminal: &mut Terminal<B>,
+    mut app: App,
+    mut db_client: Option<DbClient>,
+) -> Result<()> {
+    let tick_rate = Duration::from_millis(250);
+
+    // Initial fetch
+    fetch_or_reconnect(&mut app, &mut db_client).await;
 
     loop {
         terminal.draw(|f| ui(f, &mut app))?;
@@ -148,36 +168,12 @@ pub async fn run_app<B: Backend>(
                         }
                         KeyCode::Right | KeyCode::Char('n') | KeyCode::Char('L') => {
                             app.next_page();
-                            if let Some(ref db) = db_client {
-                                app.is_loading = true;
-                                match db.fetch_statements(app.config.page_size, app.page).await {
-                                    Ok(stats) => {
-                                        app.statements = stats;
-                                        app.error_message = None;
-                                    }
-                                    Err(e) => {
-                                        app.error_message = Some(e.to_string());
-                                    }
-                                }
-                                app.is_loading = false;
-                            }
+                            fetch_or_reconnect(&mut app, &mut db_client).await;
                         }
                         KeyCode::Left | KeyCode::Char('p') | KeyCode::Char('H') => {
                             if app.page > 0 {
                                 app.previous_page();
-                                if let Some(ref db) = db_client {
-                                    app.is_loading = true;
-                                    match db.fetch_statements(app.config.page_size, app.page).await {
-                                        Ok(stats) => {
-                                            app.statements = stats;
-                                            app.error_message = None;
-                                        }
-                                        Err(e) => {
-                                            app.error_message = Some(e.to_string());
-                                        }
-                                    }
-                                    app.is_loading = false;
-                                }
+                                fetch_or_reconnect(&mut app, &mut db_client).await;
                             }
                         }
                         KeyCode::Enter | KeyCode::Char(' ') => {
@@ -186,19 +182,7 @@ pub async fn run_app<B: Backend>(
                             }
                         }
                         KeyCode::Char('r') => {
-                            if let Some(ref db) = db_client {
-                                app.is_loading = true;
-                                match db.fetch_statements(app.config.page_size, app.page).await {
-                                    Ok(stats) => {
-                                        app.statements = stats;
-                                        app.error_message = None;
-                                    }
-                                    Err(e) => {
-                                        app.error_message = Some(e.to_string());
-                                    }
-                                }
-                                app.is_loading = false;
-                            }
+                            fetch_or_reconnect(&mut app, &mut db_client).await;
                         }
                         _ => {}
                     }
@@ -209,11 +193,8 @@ pub async fn run_app<B: Backend>(
         if app.config.refresh_interval > 0
             && app.last_tick.elapsed() >= Duration::from_secs(app.config.refresh_interval)
         {
-            if let Some(ref db) = db_client {
-                if let Ok(stats) = db.fetch_statements(app.config.page_size, app.page).await {
-                    app.statements = stats;
-                    app.error_message = None;
-                }
+            if db_client.is_some() {
+                fetch_or_reconnect(&mut app, &mut db_client).await;
             }
             app.last_tick = Instant::now();
         }
@@ -323,7 +304,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         Span::styled("Enter/Space", Style::default().fg(Color::Yellow)),
         Span::raw(": Detail View | "),
         Span::styled("r", Style::default().fg(Color::Yellow)),
-        Span::raw(": Refresh | "),
+        Span::raw(": Refresh/Reconnect | "),
         Span::styled("q / Esc", Style::default().fg(Color::Yellow)),
         Span::raw(": Quit"),
     ]);
